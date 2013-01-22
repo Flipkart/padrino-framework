@@ -27,11 +27,11 @@ module Padrino
         base.default_configuration!
         base.prerequisites.concat([
           File.join(base.root, "/models.rb"),
-          File.join(base.root, "/models/**/*.rb"),
           File.join(base.root, "/lib.rb"),
           File.join(base.root, "/lib/**/*.rb")
         ]).uniq!
         Padrino.require_dependencies(base.prerequisites)
+        ActiveSupport::Dependencies.autoload_paths << "#{base.root}/models/"
         super(base) # Loading the subclass inherited method
       end
 
@@ -121,7 +121,7 @@ module Padrino
       #   directory that need to be added to +$LOAD_PATHS+ from this application
       #
       def load_paths
-        @_load_paths ||= %w(models lib mailers controllers helpers).map { |path| File.join(self.root, path) }
+        @_load_paths ||= %w(lib mailers controllers helpers).map { |path| File.join(self.root, path) }
       end
 
       ##
