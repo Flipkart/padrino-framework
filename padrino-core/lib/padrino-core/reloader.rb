@@ -221,6 +221,8 @@ module Padrino
           files  = Padrino.load_paths.map { |path| Dir["#{path}/**/*.rb"] }.flatten
           files  = files | Padrino.mounted_apps.map { |app| app.app_file }
           files  = files | Padrino.mounted_apps.map { |app| app.app_obj.dependencies }.flatten
+          files = files | ActiveSupport::Dependencies.autoload_paths.map {|path| Dir["#{path}/*.rb"]}.flatten
+
           files.uniq.map { |file|
             file = File.expand_path(file)
             next if Padrino::Reloader.exclude.any? { |base| file =~ %r{^#{Regexp.escape(base)}} } || !File.exist?(file)
