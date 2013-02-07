@@ -201,7 +201,10 @@ module Padrino
     def flush
       return unless @buffer.size > 0
       @mutex.synchronize do
-        @log.write(@buffer.slice!(0..-1).join(''))
+        #Fix for thread safety in logger. Issue raised with padrino
+        ## https://github.com/padrino/padrino-framework/issues/815#issuecomment-5033174
+        @log.write(@buffer.join(''))
+        @buffer.clear
       end
     end
 
