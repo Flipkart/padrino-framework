@@ -15,10 +15,6 @@ module Padrino
 
     # The modification times for every file in a project.
     MTIMES          = {}
-    # The list of files loaded as part of a project.
-    LOADED_FILES    = {}
-    # The list of object constants and classes loaded as part of the project.
-    LOADED_CLASSES  = {}
 
     class << self
       ##
@@ -70,19 +66,15 @@ module Padrino
         end
       end
 
+      def remove_feature(file)
+        $LOADED_FEATURES.delete(file) unless feature_excluded?(file)
+      end
       ##
       # Remove files and classes loaded with stat
       #
       def clear!
         MTIMES.clear
-        LOADED_CLASSES.each do |file, klasses|
-          klasses.each { |klass| remove_constant(klass) }
-          LOADED_CLASSES.delete(file)
-        end
-        LOADED_FILES.each do |file, dependencies|
-          dependencies.each { |dependency| $LOADED_FEATURES.delete(dependency) }
-          $LOADED_FEATURES.delete(file)
-        end
+        Storage.clear!
       end
 
       ##
@@ -108,64 +100,56 @@ module Padrino
         Padrino::Reloader.exclude_constants.concat(klasses)
       end
 
-      ##
-      # A safe Kernel::require which issues the necessary hooks depending on results
-      #
       def safe_load(file, options={})
-        began_at    = Time.now
-        force, file = options[:force], figure_path(file)
+        began_at = Time.now
+        file     = figure_path(file)
+        return unless options[:force] || file_changed?(file)
+        return require(file) if feature_excluded?(file)
 
-        # Check if file was changed or if force a reload
-        reload = MTIMES[file] && File.mtime(file) > MTIMES[file]
-        return if !force && !reload && MTIMES[file]
-
-        # Removes all classes declared in the specified file
-        if klasses = LOADED_CLASSES.delete(file)
-          klasses.each { |klass| remove_constant(klass) }
-        end
-
-        # Remove all loaded fatures with our file
-        if features = LOADED_FILES[file]
-          features.each { |feature| $LOADED_FEATURES.delete(feature) }
-        end
-
-        # Duplicate objects and loaded features before load file
-        klasses = ObjectSpace.classes.dup
-        files   = $LOADED_FEATURES.dup
-
-        # Now we can reload dependencies of our file
-        if features = LOADED_FILES.delete(file)
-          features.each { |feature| safe_load(feature, :force => true) }
-        end
-
-        # And finally load the specified file
+        Storage.prepare(file) # might call #safe_load recursively
+        logger.devel(file_new?(file) ? :loading : :reload, began_at, file)
         begin
-          logger.devel :loading, began_at, file if !reload
-          logger.debug :reload,  began_at, file if  reload
-          $LOADED_FEATURES.delete(file)
-          verbosity_was, $-v = $-v, nil
-          loaded = false
-          require(file)
-          loaded = true
-          MTIMES[file] = File.mtime(file)
-        rescue SyntaxError => e
-          logger.error "Cannot require #{file} due to a syntax error: #{e.message}"
-        ensure
-          $-v = verbosity_was
-          new_constants = (ObjectSpace.classes - klasses).uniq
-          if loaded
-            # Store the file details
-            LOADED_CLASSES[file] = new_constants
-            LOADED_FILES[file]   = ($LOADED_FEATURES - files - [file]).uniq
-            # Track only features in our Padrino.root
-            LOADED_FILES[file].delete_if { |feature| !in_root?(feature) }
-          else
-            logger.devel "Failed to load #{file}; removing partially defined constants"
-            new_constants.each { |klass| remove_constant(klass) }
+          with_silence{ require(file) }
+          Storage.commit(file)
+          update_modification_time(file)
+        rescue Exception => exception
+          unless options[:cyclic]
+            logger.error "Failed to load #{file}; removing partially defined constants"
           end
-
+          Storage.rollback(file)
+          raise
         end
       end
+
+      def feature_excluded?(file)
+        !file.start_with?(Padrino.root) || exclude.any?{ |excluded_path| file.start_with?(excluded_path) }
+      end
+
+      def update_modification_time(file)
+        MTIMES[file] = File.mtime(file)
+      end
+
+      ###
+      # Returns true if the file is new or it's modification time changed.
+      #
+      def file_changed?(file)
+        file_new?(file) || File.mtime(file) > MTIMES[file]
+      end
+
+      ###
+      # Returns true if the file is new.
+      #
+      def file_new?(file)
+        MTIMES[file].nil?
+      end
+
+      def with_silence
+        verbosity_level, $-v = $-v, nil
+        yield
+      ensure
+        $-v = verbosity_level
+      end
+
 
       ##
       # Returns true if the file is defined in our padrino root
@@ -184,7 +168,7 @@ module Padrino
       #
       def remove_constant(const)
         return if exclude_constants.compact.uniq.any? { |c| (const.to_s =~ %r{^#{Regexp.escape(c)}}) } &&
-                 !include_constants.compact.uniq.any? { |c| (const.to_s =~ %r{^#{Regexp.escape(c)}}) }
+            !include_constants.compact.uniq.any? { |c| (const.to_s =~ %r{^#{Regexp.escape(c)}}) }
         begin
           parts  = const.to_s.split("::")
           base   = parts.size == 1 ? Object : parts[0..-2].join("::").constantize
@@ -195,38 +179,38 @@ module Padrino
       end
 
       private
-        ##
-        # Return the mounted_apps providing the app location
-        # Can be an array because in one app.rb we can define multiple Padrino::Appplications
-        #
-        def mounted_apps_of(file)
-          file = figure_path(file)
-          Padrino.mounted_apps.find_all { |app| File.identical?(file, app.app_file) }
-        end
+      ##
+      # Return the mounted_apps providing the app location
+      # Can be an array because in one app.rb we can define multiple Padrino::Appplications
+      #
+      def mounted_apps_of(file)
+        file = figure_path(file)
+        Padrino.mounted_apps.find_all { |app| File.identical?(file, app.app_file) }
+      end
 
-        ##
-        # Returns true if file is in our Padrino.root
-        #
-        def in_root?(file)
-          # This is better but slow:
-          #   Pathname.new(Padrino.root).find { |f| File.identical?(Padrino.root(f), figure_path(file)) }
-          figure_path(file) =~ %r{^#{Regexp.escape(Padrino.root)}}
-        end
+      ##
+      # Returns true if file is in our Padrino.root
+      #
+      def in_root?(file)
+        # This is better but slow:
+        #   Pathname.new(Padrino.root).find { |f| File.identical?(Padrino.root(f), figure_path(file)) }
+        figure_path(file) =~ %r{^#{Regexp.escape(Padrino.root)}}
+      end
 
-        ##
-        # Searches Ruby files in your +Padrino.load_paths+ , Padrino::Application.load_paths
-        # and monitors them for any changes.
-        #
-        def rotation
-          files  = Padrino.load_paths.map { |path| Dir["#{path}/**/*.rb"] }.flatten
-          files  = files | Padrino.mounted_apps.map { |app| app.app_file }
-          files  = files | Padrino.mounted_apps.map { |app| app.app_obj.dependencies }.flatten
-          files.uniq.map { |file|
-            file = File.expand_path(file)
-            next if Padrino::Reloader.exclude.any? { |base| file =~ %r{^#{Regexp.escape(base)}} } || !File.exist?(file)
-            yield(file, File.mtime(file))
-          }.compact
-        end
+      ##
+      # Searches Ruby files in your +Padrino.load_paths+ , Padrino::Application.load_paths
+      # and monitors them for any changes.
+      #
+      def rotation
+        files  = Padrino.load_paths.map { |path| Dir["#{path}/**/*.rb"] }.flatten
+        files  = files | Padrino.mounted_apps.map { |app| app.app_file }
+        files  = files | Padrino.mounted_apps.map { |app| app.app_obj.dependencies }.flatten
+        files.uniq.map { |file|
+          file = File.expand_path(file)
+          next if Padrino::Reloader.exclude.any? { |base| file =~ %r{^#{Regexp.escape(base)}} } || !File.exist?(file)
+          yield(file, File.mtime(file))
+        }.compact
+      end
     end # self
 
     ##
@@ -252,3 +236,121 @@ module Padrino
     end
   end # Reloader
 end # Padrino
+
+module Padrino
+  module Reloader
+    module Storage
+      extend self
+
+      @constants = Set.new
+
+      def clear!
+        files.each_key do |file|
+          remove(file)
+          Reloader.remove_feature(file)
+        end
+        @files = {}
+      end
+
+      def remove(name)
+        file = files[name] || return
+        file[:constants].each{ |constant| Reloader.remove_constant(constant) }
+        file[:features].each{ |feature| Reloader.remove_feature(feature) }
+        files.delete(name)
+      end
+
+      def prepare(name)
+        file = remove(name)
+        @old_entries ||= {}
+        if @constants.empty?
+          @constants.merge(ObjectSpace.classes)
+          @old_entries[name] = {
+              :constants => @constants,
+              :features  => old_features = Set.new($LOADED_FEATURES.dup)
+          }
+        else
+          @old_entries[name] = {
+              :constants => @constants,
+              :features  => old_features = Set.new($LOADED_FEATURES.dup)
+          }
+        end
+        features = file && file[:features] || []
+        features.each{ |feature| Reloader.safe_load(feature, :force => true) }
+        Reloader.remove_feature(name) if old_features.include?(name)
+      end
+
+      def commit(name)
+        entry = {
+            :constants => new_constants = ObjectSpace.new_classes(@old_entries[name][:constants]),
+            :features  => Set.new($LOADED_FEATURES) - @old_entries[name][:features] - [name]
+        }
+        @constants.merge(new_constants)
+        files[name] = entry
+        @old_entries.delete(name)
+      end
+
+      def rollback(name)
+        new_constants = ObjectSpace.new_classes(@old_entries[name][:constants])
+        @constants.clear
+        new_constants.each{ |klass| Reloader.remove_constant(klass) }
+        @old_entries.delete(name)
+      end
+
+      private
+
+      def files
+        @files ||= {}
+      end
+    end
+  end
+end
+
+module ObjectSpace
+  class << self
+    ##
+    # Returns all the classes in the object space.
+    # Optionally, a block can be passed, for example the following code
+    # would return the classes that start with the character "A":
+    #
+    #  ObjectSpace.classes do |klass|
+    #    if klass.to_s[0] == "A"
+    #      klass
+    #    end
+    #  end
+    #
+    def classes
+      rs = Set.new
+
+      ObjectSpace.each_object(Class).each do |klass|
+        if block_given?
+          if r = yield(klass)
+            # add the returned value if the block returns something
+            rs << r
+          end
+        else
+          rs << klass
+        end
+      end
+
+      rs
+    end
+
+    ##
+    # Returns a list of existing classes that are not included in "snapshot"
+    # This method is useful to get the list of new classes that were loaded
+    # after an event like requiring a file.
+    # Usage:
+    #
+    #   snapshot = ObjectSpace.classes
+    #   # require a file
+    #   ObjectSpace.new_classes(snapshot)
+    #
+    def new_classes(snapshot)
+      self.classes do |klass|
+        if !snapshot.include?(klass)
+          klass
+        end
+      end
+    end
+  end
+end
